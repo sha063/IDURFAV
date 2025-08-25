@@ -34,7 +34,7 @@ def load_face_model():
 @st.cache_resource
 def load_existing_features():
     try:
-        file_id = "YOUR_FILE_ID_HERE"  # Replace with your actual Google Drive file ID
+        file_id = "1mdOlFLcpCe5HIhubUpkzd6caoVtnLftM"  # Replace with your actual Google Drive file ID
         url = f"https://drive.google.com/uc?id={file_id}"
         output = "features3_fusion_merged.npy"
         if not os.path.exists(output):
