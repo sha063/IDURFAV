@@ -1,0 +1,9 @@
+streamlit
+insightface
+opencv-python
+numpy
+faiss-cpu
+scipy
+onnxruntime
+gdown
+Pillow
