@@ -1,4 +1,5 @@
-import streamlit as st
+#!pip install insightface opencv-python numpy faiss-cpu scipy onnxruntime
+import cv2
 import numpy as np
 import faiss
 import logging
@@ -6,68 +7,38 @@ import os
 from typing import List, Dict, Tuple
 from scipy.spatial.transform import Rotation
 import insightface
-import cv2
-from PIL import Image
-import gdown
-import io
+import os
 
-# Initialize logging (Streamlit-friendly: console + optional file)
+#1
+query_image_path = "drive/MyDrive/input/search.jpg"
+
+#2
+#base_dir = os.getenv("QUERY_IMAGE_BASE_DIR")
+#query_image_path = file_path.replace('My Drive','drive/MyDrive')
+
+features_file = "drive/MyDrive/features3_fusion_merged.npy"
+report_file = "search_report.txt"
+debug_dir = "debug_images"
+os.makedirs(debug_dir, exist_ok=True)
+
+# Initialize logging with detailed output
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    handlers=[
+        logging.FileHandler('search_log.txt'),
+        logging.StreamHandler()
+    ]
 )
 
-# Cache InsightFace model loading
-@st.cache_resource
-def load_face_model():
-    try:
-        face_analysis = insightface.app.FaceAnalysis(det_name='retinaface_r50_v1', rec_name='arcface_r100_v1')
-        face_analysis.prepare(ctx_id=-1, det_size=(640, 640))  # CPU mode
-        logging.info("InsightFace initialized successfully")
-        return face_analysis
-    except Exception as e:
-        logging.error(f"InsightFace initialization failed: {str(e)}")
-        raise
-
-# Download and load .npy from Google Drive (cached)
-@st.cache_resource
-def load_existing_features():
-    try:
-        file_id = "YOUR_FILE_ID_HERE"  # Replace with your actual Google Drive file ID
-        url = f"https://drive.google.com/uc?id={file_id}"
-        output = "features3_fusion_merged.npy"
-        if not os.path.exists(output):
-            with st.spinner("Downloading large feature database (241 MB)... This may take a minute."):
-                gdown.download(url, output, quiet=False)
-        data = np.load(output, allow_pickle=True).item()
-        feature_vectors = data.get('feature_vectors', [])
-        image_paths = data.get('image_paths', [])
-        if not feature_vectors:
-            raise ValueError("No feature vectors found in the database")
-        dimension = len(feature_vectors[0])
-        logging.info(f"Loaded {len(feature_vectors)} feature vectors with dimension {dimension}")
-        return feature_vectors, image_paths
-    except Exception as e:
-        logging.error(f"Failed to load features: {str(e)}")
-        st.error(f"Error loading database: {str(e)}")
-        raise
-
-# Build FAISS index (cached)
-@st.cache_resource
-def build_feature_index(_feature_vectors):  # Use hashable param for cache
-    try:
-        if not _feature_vectors:
-            raise ValueError("Feature vector list is empty")
-        dimension = len(_feature_vectors[0])
-        index = faiss.IndexFlatL2(dimension)
-        index.add(np.array(_feature_vectors).astype(np.float32))
-        logging.info(f"Built FAISS index with {len(_feature_vectors)} vectors of dimension {dimension}")
-        return index
-    except Exception as e:
-        logging.error(f"Failed to build FAISS index: {str(e)}")
-        st.error(f"Error building index: {str(e)}")
-        raise
+# Initialize InsightFace
+try:
+    face_analysis = insightface.app.FaceAnalysis(det_name='retinaface_r50_v1', rec_name='arcface_r100_v1')
+    face_analysis.prepare(ctx_id=-1, det_size=(640, 640))  # CPU mode
+    logging.info("InsightFace initialized successfully")
+except Exception as e:
+    logging.error(f"InsightFace initialization failed: {str(e)}")
+    raise
 
 def preprocess_image(image: np.ndarray, contrast_factor: float = 1.0, resolution_factor: float = 1.0) -> np.ndarray:
     """Preprocess image with optional contrast and resolution adjustment."""
@@ -127,21 +98,31 @@ def compute_curvature(points: np.ndarray, indices: range) -> float:
         logging.warning(f"Curvature computation failed: {str(e)}")
         return 0.0
 
-def extract_facial_features(image: np.ndarray, model) -> Dict:
+def extract_facial_features(image: np.ndarray, image_path: str) -> Dict:
     """Extract features using InsightFace with pose and curvature for 519-dimensional vectors."""
     try:
+        # Preprocess image
         processed_image = preprocess_image(image)
-        faces = model.get(processed_image)
-        if not faces:
-            return {'features': None, 'status': 'failed', 'reason': 'No faces detected', 'detection_method': 'insightface', 'confidence': 0.0}
+        logging.info(f"Preprocessed image: {image_path}")
 
+        # Detect faces and extract features with InsightFace
+        faces = face_analysis.get(processed_image)
+        if not faces:
+            logging.warning(f"No faces detected in {image_path}")
+            return {'features': None, 'image_path': image_path, 'status': 'failed',
+                    'reason': 'No faces detected', 'detection_method': 'insightface', 'confidence': 0.0}
+
+        # Select largest face by bounding box area
         areas = [(f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]) for f in faces]
         max_idx = np.argmax(areas)
         selected_face = faces[max_idx]
-        embedding = selected_face.embedding / np.linalg.norm(selected_face.embedding)
+        embedding = selected_face.embedding / np.linalg.norm(selected_face.embedding)  # Normalize ArcFace embedding
         confidence = selected_face.det_score
 
+        # Initialize default additional features
         additional_features = np.zeros(7, dtype=np.float32)
+
+        # Process landmarks if available
         landmarks = selected_face.landmark
         if landmarks is not None and isinstance(landmarks, np.ndarray) and landmarks.shape == (68, 2):
             roll, pitch, yaw = estimate_pose(landmarks)
@@ -151,20 +132,84 @@ def extract_facial_features(image: np.ndarray, model) -> Dict:
             lip_curvature = compute_curvature(landmarks, range(48, 55))
 
             additional_features = np.array([roll / 180.0, pitch / 180.0, yaw / 180.0,
-                                            jaw_curvature, left_eyebrow_curvature,
-                                            right_eyebrow_curvature, lip_curvature], dtype=np.float32)
+                                           jaw_curvature, left_eyebrow_curvature,
+                                           right_eyebrow_curvature, lip_curvature], dtype=np.float32)
         else:
-            confidence *= 0.8
+            logging.warning(f"Landmarks missing or invalid for {image_path}, using default features")
+            confidence *= 0.8  # Reduce confidence if landmarks are missing
 
+        # Combine ArcFace embedding with additional features
         features = np.concatenate([embedding, additional_features])
-        return {'features': features, 'status': 'success', 'reason': None, 'detection_method': 'insightface', 'confidence': confidence}
-    except Exception as e:
-        logging.error(f"Feature extraction failed: {str(e)}")
-        return {'features': None, 'status': 'failed', 'reason': f'Exception: {str(e)}', 'detection_method': 'insightface', 'confidence': 0.0}
+        logging.info(f"Extracted features for {image_path}, dimension: {len(features)}, confidence: {confidence:.4f}")
 
-def reverse_image_search(query_image_np: np.ndarray, index: faiss.Index, image_paths: List[str], model, top_k: int = 20) -> List[Dict]:
+        # Debug visualization
+        debug_img = processed_image.copy()
+        bbox = selected_face.bbox.astype(int)
+        cv2.rectangle(debug_img, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
+        if landmarks is not None and isinstance(landmarks, np.ndarray) and landmarks.shape == (68, 2):
+            for x, y in landmarks:
+                cv2.circle(debug_img, (int(x), int(y)), 2, (0, 0, 255), -1)
+        debug_path = os.path.join(debug_dir, f"{os.path.basename(image_path)}_insightface_debug.jpg")
+        cv2.imwrite(debug_path, debug_img)
+        logging.info(f"Saved debug image: {debug_path}")
+
+        return {'features': features, 'image_path': image_path, 'status': 'success',
+                'reason': None, 'detection_method': 'insightface', 'confidence': confidence}
+    except Exception as e:
+        logging.error(f"Feature extraction failed for {image_path}: {str(e)}")
+        debug_path = os.path.join(debug_dir, f"{os.path.basename(image_path)}_failed.jpg")
+        cv2.imwrite(debug_path, image)
+        return {'features': None, 'image_path': image_path, 'status': 'failed',
+                'reason': f'Exception: {str(e)}', 'detection_method': 'insightface', 'confidence': 0.0}
+
+def load_existing_features(features_file: str) -> Tuple[List[np.ndarray], List[str]]:
+    """Load existing features and image paths from file."""
     try:
-        query_result = extract_facial_features(query_image_np, model)
+        if not os.path.exists(features_file):
+            raise FileNotFoundError(f"Features file not found: {features_file}")
+        data = np.load(features_file, allow_pickle=True).item()
+        feature_vectors = data.get('feature_vectors', [])
+        image_paths = data.get('image_paths', [])
+        if not feature_vectors:
+            raise ValueError("No feature vectors found in the database")
+        # Verify feature vector dimensions
+        dimension = len(feature_vectors[0])
+        for i, vec in enumerate(feature_vectors):
+            if len(vec) != dimension:
+                raise ValueError(f"Inconsistent feature vector dimension at index {i}: expected {dimension}, got {len(vec)}")
+        logging.info(f"Loaded {len(feature_vectors)} feature vectors with dimension {dimension} from {features_file}")
+        return feature_vectors, image_paths
+    except Exception as e:
+        logging.error(f"Failed to load existing features from {features_file}: {str(e)}")
+        raise
+
+def build_feature_index(feature_vectors: List[np.ndarray]) -> faiss.Index:
+    """Build FAISS index for feature vectors."""
+    try:
+        if not feature_vectors:
+            raise ValueError("Feature vector list is empty")
+        dimension = len(feature_vectors[0])
+        index = faiss.IndexFlatL2(dimension)
+        index.add(np.array(feature_vectors).astype(np.float32))
+        logging.info(f"Built FAISS index with {len(feature_vectors)} vectors of dimension {dimension}")
+        return index
+    except Exception as e:
+        logging.error(f"Failed to build FAISS index: {str(e)}")
+        raise
+
+def reverse_image_search(
+    query_image_path: str,
+    index: faiss.Index,
+    image_paths: List[str],
+    top_k: int = 5
+) -> Tuple[List[Dict], str]:
+    """Perform reverse image search using FAISS index."""
+    try:
+        query_image = cv2.imread(query_image_path)
+        if query_image is None:
+            raise ValueError(f"Failed to load query image: {query_image_path}")
+
+        query_result = extract_facial_features(query_image, query_image_path)
         if query_result['status'] == 'failed':
             raise ValueError(f"Failed to extract features from query image: {query_result['reason']}")
 
@@ -172,6 +217,7 @@ def reverse_image_search(query_image_np: np.ndarray, index: faiss.Index, image_p
         if query_vector.shape[1] != index.d:
             raise ValueError(f"Query vector dimension {query_vector.shape[1]} does not match index dimension {index.d}")
         distances, indices = index.search(query_vector, top_k)
+        logging.info(f"Performed search, found {len(indices[0])} matches")
 
         results = []
         for i in range(top_k):
@@ -182,36 +228,57 @@ def reverse_image_search(query_image_np: np.ndarray, index: faiss.Index, image_p
                     'distance': float(distances[0][i]),
                     'index': int(idx)
                 })
-        return results
+        return results, query_result['detection_method']
     except Exception as e:
-        logging.error(f"Reverse image search failed: {str(e)}")
+        logging.error(f"Reverse image search failed for {query_image_path}: {str(e)}")
         raise
 
-# Streamlit UI
-st.title("🔍 Face-Based Reverse Image Search")
+def main(top_k: int = 20):
+    """Main function to perform reverse image search using existing database."""
+    try:
+        if not os.path.exists(query_image_path):
+            raise FileNotFoundError(f"Query image not found: {query_image_path}")
+        logging.info(f"Starting reverse image search for {query_image_path}")
 
-uploaded_file = st.file_uploader("Upload a query image", type=["jpg", "jpeg", "png"])
+        # Load existing features from .npy file
+        feature_vectors, image_paths = load_existing_features(features_file)
 
-if uploaded_file:
-    # Load uploaded image
-    image = Image.open(uploaded_file).convert('RGB')
-    st.image(image, caption='Uploaded Image', use_column_width=True)
-    image_np = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        # Build FAISS index
+        index = build_feature_index(feature_vectors)
 
-    # Load resources
-    with st.spinner("Loading model, database, and index..."):
-        model = load_face_model()
-        feature_vectors, image_paths = load_existing_features()
-        index = build_feature_index(tuple(map(tuple, feature_vectors)))  # Tuple for hashing in cache
+        # Perform reverse image search
+        results, query_detection_method = reverse_image_search(query_image_path, index, image_paths, top_k=top_k)
 
-    # Perform search
-    with st.spinner("Performing search..."):
-        try:
-            results = reverse_image_search(image_np, index, image_paths, model, top_k=20)
-            st.subheader("Top Matches:")
-            for result in results:
-                st.write(f"Match: {os.path.basename(result['image_path'])}, Distance: {result['distance']:.4f}")
-                # If image_paths are URLs, add: st.image(result['image_path'], width=150)
-            st.success("Search complete!")
-        except Exception as e:
-            st.error(f"Error during search: {str(e)}")
+        # Generate report
+        report = []
+        report.append(f"Query Image: {os.path.basename(query_image_path)}")
+        report.append(f"Status: Success")
+        report.append(f"Detection Method: {query_detection_method}")
+        report.append(f"Top {top_k} Matches:")
+        for result in results:
+            report.append(f"  Match: {os.path.basename(result['image_path'])}, Distance: {result['distance']:.4f}")
+        report.append("")
+
+        # Save report
+        with open(report_file, 'w') as f:
+            f.write("\n".join(report))
+        logging.info(f"Search report saved to {report_file}")
+
+        # Print results
+        print(f"\n✅ Search report saved to {report_file}")
+        print(f"Top {top_k} matches for {query_image_path}:")
+        for result in results:
+            print(f"Match: {os.path.basename(result['image_path'])}, Distance: {result['distance']:.4f}")
+
+    except Exception as e:
+        logging.error(f"Main execution failed: {str(e)}")
+        error_report = [f"Query Image: {os.path.basename(query_image_path)}"]
+        error_report.append(f"Status: Failed")
+        error_report.append(f"Reason: {str(e)}")
+        with open(report_file, 'w') as f:
+            f.write("\n".join(error_report))
+        print(f"⚠️ Error: {str(e)}")
+        print(f"Search report saved to {report_file}")
+
+if __name__ == "__main__":
+    main(top_k=20)
